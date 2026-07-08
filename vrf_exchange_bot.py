@@ -9,18 +9,30 @@ Requirements (requirements.txt):
     python-telegram-bot==21.6
     aiosqlite
     matplotlib   # опционально — для /chart
+    aiohttp      # публичный REST API для сторонних разработчиков
 
 Env vars:
     BOT_TOKEN   — токен бота (обязательно)
     DB_PATH     — путь к SQLite базе (по умолчанию vrf_exchange.db)
     ADMIN_IDS   — список ID администраторов через запятую (опционально)
+    PORT        — порт для REST API (Railway подставляет автоматически)
+    API_CORS_ORIGIN — Access-Control-Allow-Origin для API (по умолчанию "*")
+
+Публичный REST API (для внешних сайтов/приложений) поднимается на
+0.0.0.0:$PORT и живёт независимо от long-polling бота. Документация
+для разработчиков — см. API_DOCS.md.
 """
 
 import asyncio
+import hashlib
 import io
+import json
 import logging
 import os
 import random
+import secrets
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
@@ -79,6 +91,7 @@ ADMIN_IDS: list = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.st
 
 STARTING_USD   = 1000.0
 STARTING_VRF   = 0.0
+STARTING_SCAM  = 100.0
 
 PRICE_START        = 1.00     # USD за 1 VRF
 PRICE_TICK_SECONDS = 45
@@ -100,6 +113,13 @@ STAKE_TIERS = {
     "14d":  {"label": "📅 14 дней", "apr": 0.22, "lock_days": 14, "penalty": 0.12},
     "30d":  {"label": "📅 30 дней", "apr": 0.35, "lock_days": 30, "penalty": 0.15},
 }
+
+# ── Public REST API ────────────────────────────────────
+API_PORT         = int(os.getenv("PORT", "8080"))
+API_CORS_ORIGIN  = os.getenv("API_CORS_ORIGIN", "*")
+API_KEY_PREFIX   = "vrf_live_"
+API_RATE_LIMIT   = 120     # запросов
+API_RATE_WINDOW  = 60      # секунд, скользящее окно на ключ/IP
 
 E_UP, E_DOWN, E_FLAT = "🟢", "🔴", "⚪️"
 E_COIN, E_USD, E_LOCK = "💎", "💵", "🔒"
@@ -146,6 +166,14 @@ def fmt_price(p: float) -> str:
     if p >= 100: return f"{p:,.2f}"
     if p >= 1:   return f"{p:,.4f}"
     return f"{p:.6f}"
+
+
+def fmt_scam(n: float) -> str:
+    """Format a SCAM amount trimmed of trailing zeros, comma as decimal separator."""
+    s = f"{n:.6f}".rstrip("0").rstrip(".")
+    if s in ("", "-"):
+        s = "0"
+    return s.replace(".", ",")
 
 
 def fmt_cd(seconds: int) -> str:
@@ -229,7 +257,16 @@ async def db_init() -> None:
                 first_name  TEXT DEFAULT '',
                 usd         REAL DEFAULT {STARTING_USD},
                 vrf         REAL DEFAULT {STARTING_VRF},
+                scam        REAL DEFAULT {STARTING_SCAM},
                 created_at  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS scam_transfers (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id     INTEGER NOT NULL,
+                to_id       INTEGER NOT NULL,
+                amount      REAL NOT NULL,
+                ts          TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS stakes (
@@ -260,19 +297,36 @@ async def db_init() -> None:
                 price   REAL NOT NULL,
                 ts      TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                key_hash    TEXT NOT NULL UNIQUE,
+                key_prefix  TEXT NOT NULL,
+                label       TEXT DEFAULT '',
+                created_at  TEXT NOT NULL,
+                last_used_at TEXT DEFAULT NULL,
+                revoked     INTEGER DEFAULT 0
+            );
         """)
         await db.commit()
+        # ── Migration: add `scam` column to pre-existing DBs (safe no-op if present) ──
+        try:
+            await db.execute(f"ALTER TABLE users ADD COLUMN scam REAL DEFAULT {STARTING_SCAM}")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
     log.info("Database initialised at %s", DB_PATH)
 
 
 async def db_ensure_user(uid: int, username: str, first_name: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO users (user_id, username, first_name, usd, vrf, created_at)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO users (user_id, username, first_name, usd, vrf, scam, created_at)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(user_id) DO UPDATE SET
                  username=excluded.username, first_name=excluded.first_name""",
-            (uid, username or "", first_name or "", STARTING_USD, STARTING_VRF, _now()),
+            (uid, username or "", first_name or "", STARTING_USD, STARTING_VRF, STARTING_SCAM, _now()),
         )
         await db.commit()
 
@@ -285,12 +339,14 @@ async def db_get_user(uid: int) -> Optional[dict]:
             return dict(row) if row else None
 
 
-async def db_set_balances(uid: int, usd: float = None, vrf: float = None) -> None:
+async def db_set_balances(uid: int, usd: float = None, vrf: float = None, scam: float = None) -> None:
     sets, args = [], []
     if usd is not None:
         sets.append("usd=?"); args.append(max(0.0, usd))
     if vrf is not None:
         sets.append("vrf=?"); args.append(max(0.0, vrf))
+    if scam is not None:
+        sets.append("scam=?"); args.append(max(0.0, scam))
     if not sets:
         return
     args.append(uid)
@@ -306,6 +362,24 @@ async def db_add_usd(uid: int, amount: float) -> float:
         async with db.execute("SELECT usd FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0.0
+
+
+async def db_add_scam(uid: int, amount: float) -> float:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET scam=scam+? WHERE user_id=?", (amount, uid))
+        await db.commit()
+        async with db.execute("SELECT scam FROM users WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0.0
+
+
+async def db_log_scam_transfer(from_id: int, to_id: int, amount: float) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scam_transfers (from_id, to_id, amount, ts) VALUES (?,?,?,?)",
+            (from_id, to_id, amount, _now()),
+        )
+        await db.commit()
 
 
 async def db_add_vrf(uid: int, amount: float) -> float:
@@ -441,6 +515,89 @@ def stake_time_left(stake: dict) -> int:
 
 
 # ══════════════════════════════════════════════════════
+#              API KEYS  🔑  (для внешних разработчиков)
+# ══════════════════════════════════════════════════════
+
+def _hash_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+def generate_api_key() -> Tuple[str, str]:
+    """Returns (raw_key_to_show_once, key_hash_to_store)."""
+    raw = API_KEY_PREFIX + secrets.token_urlsafe(32)
+    return raw, _hash_key(raw)
+
+
+async def db_create_api_key(uid: int, label: str = "") -> Tuple[int, str]:
+    raw, key_hash = generate_api_key()
+    prefix = raw[:len(API_KEY_PREFIX) + 6] + "…"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO api_keys (user_id, key_hash, key_prefix, label, created_at)
+               VALUES (?,?,?,?,?)""",
+            (uid, key_hash, prefix, label, _now()),
+        )
+        await db.commit()
+        return cur.lastrowid, raw
+
+
+async def db_get_user_from_key(raw_key: str) -> Optional[dict]:
+    """Validate a raw API key and return the owning user's row, or None."""
+    if not raw_key or not raw_key.startswith(API_KEY_PREFIX):
+        return None
+    key_hash = _hash_key(raw_key)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM api_keys WHERE key_hash=? AND revoked=0", (key_hash,)
+        ) as cur:
+            krow = await cur.fetchone()
+        if not krow:
+            return None
+        await db.execute(
+            "UPDATE api_keys SET last_used_at=? WHERE id=?", (_now(), krow["id"])
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT * FROM users WHERE user_id=?", (krow["user_id"],)
+        ) as cur:
+            urow = await cur.fetchone()
+            return dict(urow) if urow else None
+
+
+async def db_list_user_keys(uid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM api_keys WHERE user_id=? AND revoked=0 ORDER BY created_at DESC", (uid,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_revoke_key(key_id: int, uid: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=?", (key_id, uid)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# Simple in-memory sliding-window rate limiter (per API key or IP)
+_rate_hits: dict = {}
+
+
+def _rate_limited(bucket: str) -> bool:
+    now = time.time()
+    hits = _rate_hits.setdefault(bucket, [])
+    hits[:] = [t for t in hits if now - t < API_RATE_WINDOW]
+    if len(hits) >= API_RATE_LIMIT:
+        return True
+    hits.append(now)
+    return False
+
+
+# ══════════════════════════════════════════════════════
 #              MARKET SIMULATION 📈
 # ══════════════════════════════════════════════════════
 
@@ -526,6 +683,111 @@ def _price_chart_sync(rows: list) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════
+#      SCAM TRANSFER RECEIPT IMAGE  🎭  (Pillow)
+# ══════════════════════════════════════════════════════
+# Генерируется при переводе токена SCAM через текстовую команду "пер".
+
+def _scam_transfer_image_sync(amount: float, sender_name: str, recipient_name: str) -> Optional[bytes]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    W, H = 800, 420
+    BG_TOP = (22, 6, 10)
+    BG_BOT = (54, 12, 16)
+    GOLD   = (255, 197, 64)
+    RED    = (224, 64, 64)
+    WHITE  = (238, 230, 226)
+    MUTED  = (170, 140, 140)
+    LINE   = (96, 44, 44)
+
+    img = Image.new("RGB", (W, H), BG_TOP)
+    d = ImageDraw.Draw(img)
+    for y in range(H):
+        t = y / H
+        col = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(3))
+        d.line([(0, y), (W, y)], fill=col)
+
+    # Diagonal hazard-stripe accents (top-left / bottom-right corners)
+    stripe_w = 14
+    for x in range(-H, W, stripe_w * 2):
+        d.line([(x, 0), (x + H, H)], fill=(0, 0, 0), width=stripe_w)
+    overlay = Image.new("RGB", (W, H), BG_TOP)
+    od = ImageDraw.Draw(overlay)
+    for y in range(H):
+        t = y / H
+        col = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(3))
+        od.line([(0, y), (W, y)], fill=col)
+    img = Image.blend(img, overlay, 0.86)
+    d = ImageDraw.Draw(img)
+
+    _BOLD = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    _REG = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+
+    def _font(paths, size):
+        for p in paths:
+            try:
+                return ImageFont.truetype(p, size)
+            except (OSError, IOError):
+                continue
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    f_amount = _font(_BOLD, 92)
+    f_tag    = _font(_BOLD, 32)
+    f_body   = _font(_REG, 25)
+    f_small  = _font(_REG, 18)
+
+    def tw(s, f):
+        b = d.textbbox((0, 0), s, font=f)
+        return b[2] - b[0]
+
+    def tc(cy, s, f, fill):
+        x = W // 2 - tw(s, f) // 2
+        d.text((x, cy), s, font=f, fill=fill)
+
+    amount_str = fmt_scam(amount)
+
+    # Top: big amount, gold with drop shadow
+    x = W // 2 - tw(amount_str, f_amount) // 2
+    d.text((x + 3, 66 + 3), amount_str, font=f_amount, fill=(0, 0, 0))
+    d.text((x, 66), amount_str, font=f_amount, fill=GOLD)
+
+    # SCAM tag chip under the amount
+    tag = "SCAM"
+    tag_w = tw(tag, f_tag)
+    cx1, cy1 = W // 2 - tag_w // 2 - 18, 178
+    cx2, cy2 = W // 2 + tag_w // 2 + 18, 178 + 46
+    d.rounded_rectangle([cx1, cy1, cx2, cy2], radius=10, outline=RED, width=2)
+    tc(cy1 + 8, tag, f_tag, RED)
+
+    # Divider
+    d.line([(70, 258), (W - 70, 258)], fill=LINE, width=2)
+
+    # Bottom sentence — exact requested template
+    bottom = f"#SCAM отправил(а) {amount_str} SCAM для {recipient_name}"
+    tc(288, bottom, f_body, WHITE)
+
+    # Small sender attribution line
+    small = f"от {sender_name}"
+    tc(330, small, f_small, MUTED)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+# ══════════════════════════════════════════════════════
 #          RICH CARDS  —  market / balance / stakes
 # ══════════════════════════════════════════════════════
 
@@ -582,6 +844,7 @@ async def _balance_cards(uid: int) -> Tuple[str, str]:
     u = await db_get_user(uid)
     price = market["price"]
     usd, vrf = (u["usd"], u["vrf"]) if u else (0.0, 0.0)
+    scam = u["scam"] if u else 0.0
 
     stakes = await db_get_user_stakes(uid)
     staked_total = sum(s["amount"] for s in stakes)
@@ -597,6 +860,7 @@ async def _balance_cards(uid: int) -> Tuple[str, str]:
         f"<tr><td>{E_USD} USD</td><td align=\"right\"><b>{fmt(usd)}</b></td></tr>"
         f"<tr><td>{E_COIN} VRF</td><td align=\"right\"><b>{fmt(vrf)}</b> "
         f"<i>(~{fmt(vrf_value)} USD)</i></td></tr>"
+        f"<tr><td>🎭 SCAM</td><td align=\"right\"><b>{fmt_scam(scam)}</b></td></tr>"
         f"<tr><td>{E_LOCK} В стейке</td><td align=\"right\"><b>{fmt(staked_total)} VRF</b> "
         f"<i>(~{fmt(staked_value)} USD)</i></td></tr>"
         f"<tr><td>💠 Накоплено %</td><td align=\"right\"><b>{fmt(accrued_total)} VRF</b></td></tr>"
@@ -607,6 +871,7 @@ async def _balance_cards(uid: int) -> Tuple[str, str]:
         f"👤 <b>Баланс</b>\n\n"
         f"{E_USD} USD: <b>{fmt(usd)}</b>\n"
         f"{E_COIN} VRF: <b>{fmt(vrf)}</b> (~{fmt(vrf_value)} USD)\n"
+        f"🎭 SCAM: <b>{fmt_scam(scam)}</b>\n"
         f"{E_LOCK} В стейке: <b>{fmt(staked_total)} VRF</b>\n"
         f"💠 Накоплено %: <b>{fmt(accrued_total)} VRF</b>\n\n"
         f"💼 Всего активов: <b>~{fmt(net_worth)} USD</b>"
@@ -671,8 +936,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/stake — выбрать тариф и положить VRF под процент</li>"
         "<li>/stakes — активные стейки, начисленный процент</li>"
         "</ul>"
+        "<h3>🎭 Токен SCAM</h3>"
+        "<ul><li><code>пер 0,048</code> — перевести SCAM (ответом на сообщение получателя), "
+        "генерируется картинка-чек</li></ul>"
         "<h3>👤 Аккаунт</h3>"
-        "<ul><li>/balance — баланс USD/VRF и суммарные активы</li></ul>"
+        "<ul><li>/balance — баланс USD/VRF/SCAM и суммарные активы</li></ul>"
         "<hr/>"
         "<details open><summary>⚙️ Тарифы стейкинга</summary><ul>"
         + "".join(
@@ -687,6 +955,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📖 <b>Помощь — VRF Exchange</b>\n\n"
         "💹 /market /buy /sell /chart\n"
         "🔒 /stake /stakes\n"
+        "🎭 <code>пер 0,048</code> — перевод SCAM (ответом)\n"
         "👤 /balance\n\n"
         "Тарифы стейкинга:\n" +
         "\n".join(f"• {t['label']} — {t['apr']*100:.0f}% год." for t in STAKE_TIERS.values())
@@ -979,6 +1248,51 @@ async def cmd_stakes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+# ── API keys (личный доступ для разработчиков) ─────────
+
+async def cmd_apikey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    await db_ensure_user(u.id, u.username or "", u.first_name)
+    label = " ".join(context.args) if context.args else ""
+    key_id, raw = await db_create_api_key(u.id, label)
+    await update.message.reply_text(
+        f"🔑 <b>Новый API-ключ создан!</b>\n\n"
+        f"<code>{raw}</code>\n\n"
+        f"⚠️ Скопируй его сейчас — второй раз он не покажется.\n"
+        f"Ключ даёт доступ <b>только к твоему аккаунту</b> "
+        f"(баланс, покупка/продажа, стейкинг) через REST API.\n\n"
+        f"Используй заголовок:\n<code>Authorization: Bearer {raw[:len(API_KEY_PREFIX)+6]}…</code>\n\n"
+        f"📖 Документация: см. API_DOCS.md\n"
+        f"🗑 Управление: /apikeys",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    keys = await db_list_user_keys(u.id)
+    if not keys:
+        await update.message.reply_text(
+            "🔑 У тебя пока нет API-ключей.\n\nСоздай командой /apikey [название]"
+        )
+        return
+    lines = ["🔑 <b>Твои API-ключи</b>\n"]
+    kb_rows = []
+    for k in keys:
+        used = f"использован {k['last_used_at'][:16].replace('T',' ')}" if k["last_used_at"] else "не использовался"
+        lines.append(
+            f"\n<b>#{k['id']}</b> {('· ' + k['label']) if k['label'] else ''}\n"
+            f"<code>{k['key_prefix']}</code>\n"
+            f"создан {k['created_at'][:16].replace('T',' ')} · {used}"
+        )
+        kb_rows.append([SBtn(f"🗑 Отозвать #{k['id']}", style="danger",
+                             callback_data=f"ak:rev:{k['id']}")])
+    await update.message.reply_text(
+        "".join(lines), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+    )
+
+
 # ── Admin ────────────────────────────────────────────────
 
 async def cmd_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1041,6 +1355,28 @@ async def cmd_addvrf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"✅ Выдано <b>{fmt(amount)} VRF</b> → {mention(target.id, target.first_name)}\n"
         f"{E_COIN} Баланс: {fmt(new_bal)} VRF",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_addscam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администраторов")
+        return
+    if not update.message.reply_to_message or not context.args:
+        await update.message.reply_text("Использование: /addscam <сумма> (ответом)")
+        return
+    try:
+        amount = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ Некорректная сумма")
+        return
+    target = update.message.reply_to_message.from_user
+    await db_ensure_user(target.id, target.username or "", target.first_name)
+    new_bal = await db_add_scam(target.id, amount)
+    await update.message.reply_text(
+        f"✅ Выдано <b>{fmt_scam(amount)} SCAM</b> → {mention(target.id, target.first_name)}\n"
+        f"🎭 Баланс: {fmt_scam(new_bal)} SCAM",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1389,6 +1725,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── API keys ────────────────────────────────────────
+    if data.startswith("ak:"):
+        _, action, kid_s = data.split(":")
+        kid = int(kid_s)
+        if action == "rev":
+            ok = await db_revoke_key(kid, who.id)
+            if ok:
+                await query.answer("🗑 Ключ отозван")
+                try:
+                    await query.edit_message_reply_markup(None)
+                except TelegramError:
+                    pass
+            else:
+                await query.answer("❌ Не найден или уже отозван", show_alert=True)
+        else:
+            await query.answer()
+        return
+
     await query.answer()
 
 
@@ -1418,6 +1772,50 @@ async def _do_stake(uid: int, tier: str, amount: float) -> Tuple[bool, str]:
 #           MESSAGE HANDLER — custom amount replies
 # ══════════════════════════════════════════════════════
 
+async def _execute_scam_transfer(context, chat_id: int, reply_msg_id: int,
+                                  sender, recipient, amount: float) -> None:
+    """Deduct SCAM from sender, credit recipient, send a generated receipt image."""
+    if recipient.id == sender.id:
+        await context.bot.send_message(chat_id, "❌ Нельзя переводить SCAM самому себе!",
+                                       reply_to_message_id=reply_msg_id)
+        return
+    if amount <= 0:
+        await context.bot.send_message(chat_id, "❌ Сумма должна быть больше 0",
+                                       reply_to_message_id=reply_msg_id)
+        return
+
+    await db_ensure_user(sender.id, sender.username or "", sender.first_name)
+    await db_ensure_user(recipient.id, getattr(recipient, "username", "") or "", recipient.first_name)
+
+    su = await db_get_user(sender.id)
+    if not su or su["scam"] < amount:
+        await context.bot.send_message(
+            chat_id,
+            f"❌ Недостаточно SCAM! Есть: <b>{fmt_scam(su['scam'] if su else 0)}</b>",
+            parse_mode=ParseMode.HTML, reply_to_message_id=reply_msg_id,
+        )
+        return
+
+    await db_set_balances(sender.id, scam=su["scam"] - amount)
+    await db_add_scam(recipient.id, amount)
+    await db_log_scam_transfer(sender.id, recipient.id, amount)
+
+    loop = asyncio.get_running_loop()
+    img = await loop.run_in_executor(
+        None, _scam_transfer_image_sync, amount, sender.first_name, recipient.first_name,
+    )
+    caption = f"#SCAM отправил(а) {fmt_scam(amount)} SCAM для {recipient.first_name}"
+
+    if img:
+        await context.bot.send_photo(
+            chat_id, photo=io.BytesIO(img), caption=caption,
+            parse_mode=ParseMode.HTML, reply_to_message_id=reply_msg_id,
+        )
+    else:
+        await context.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML,
+                                       reply_to_message_id=reply_msg_id)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -1425,6 +1823,36 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if u.is_bot:
         return
     cid = update.effective_chat.id
+    text_raw = (update.message.text or "").strip()
+
+    # ── "пер <сумма>" — перевод токена SCAM (ответом на сообщение получателя) ──
+    parts = text_raw.split()
+    if parts and parts[0].lower() in ("пер", "перевод", "sendscam", "трансфер"):
+        if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+            await update.message.reply_text(
+                "❌ Ответь на сообщение получателя, чтобы перевести SCAM.\n"
+                "Использование: <code>пер 0,048</code> (ответом)",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ Укажи сумму: <code>пер 0,048</code>", parse_mode=ParseMode.HTML,
+            )
+            return
+        amount_str = parts[1].replace(" ", "").replace(",", ".")
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            await update.message.reply_text("❌ Некорректная сумма SCAM")
+            return
+
+        recipient = update.message.reply_to_message.from_user
+        await _execute_scam_transfer(
+            context, cid, update.message.message_id, u, recipient, amount,
+        )
+        return
+
     key = (cid, u.id)
     pend = pending_input.get(key)
     if not pend:
@@ -1434,7 +1862,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         pending_input.pop(key, None)
         return
 
-    text = (update.message.text or "").strip().replace(" ", "").replace(",", ".")
+    text = text_raw.replace(" ", "").replace(",", ".")
     try:
         amount = float(text)
     except ValueError:
@@ -1459,6 +1887,355 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 #                       MAIN
 # ══════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════
+#           PUBLIC REST API  🌐  (для сторонних разработчиков)
+# ══════════════════════════════════════════════════════
+# Работает независимо от long-polling бота (свой event loop в отдельном
+# потоке), поднимается на 0.0.0.0:$PORT. Railway нужно включить
+# Public Networking для этого порта, чтобы API был доступен извне.
+
+def _json_resp(data, status: int = 200):
+    from aiohttp import web as _web
+    return _web.json_response(data, status=status,
+                              dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
+def _err(msg: str, status: int = 400):
+    return _json_resp({"ok": False, "error": msg}, status)
+
+
+async def _api_auth(request) -> Optional[dict]:
+    """Extract & validate Bearer token, return the owning user's row or None."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        token = request.headers.get("X-API-Key", "").strip()
+    if not token:
+        return None
+    return await db_get_user_from_key(token)
+
+
+async def _rl_middleware(app, handler):
+    async def middleware(request):
+        from aiohttp import web as _web
+        bucket = f"ip:{request.remote}"
+        if _rate_limited(bucket):
+            return _err("Rate limit exceeded, try again later", 429)
+        try:
+            return await handler(request)
+        except _web.HTTPException:
+            raise
+        except Exception:
+            log.exception("API handler error: %s %s", request.method, request.path)
+            return _err("Internal server error", 500)
+    return middleware
+
+
+def _cors_headers() -> dict:
+    return {
+        "Access-Control-Allow-Origin": API_CORS_ORIGIN,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
+    }
+
+
+async def _cors_middleware(app, handler):
+    async def middleware(request):
+        from aiohttp import web as _web
+        if request.method == "OPTIONS":
+            return _web.Response(status=204, headers=_cors_headers())
+        resp = await handler(request)
+        resp.headers.update(_cors_headers())
+        return resp
+    return middleware
+
+
+# ── Public endpoints ───────────────────────────────────
+
+async def api_root(request):
+    return _json_resp({
+        "ok": True,
+        "name": "VRF Exchange API",
+        "version": "v1",
+        "docs": "See API_DOCS.md in the repository",
+        "endpoints": [
+            "GET  /api/v1/price",
+            "GET  /api/v1/price/history?hours=24",
+            "GET  /api/v1/stats",
+            "GET  /api/v1/tiers",
+            "GET  /api/v1/me                (auth)",
+            "POST /api/v1/trade/buy         (auth) {usd_amount}",
+            "POST /api/v1/trade/sell        (auth) {vrf_amount}",
+            "GET  /api/v1/stakes            (auth)",
+            "POST /api/v1/stakes            (auth) {tier, amount}",
+            "POST /api/v1/stakes/{id}/claim (auth)",
+            "POST /api/v1/stakes/{id}/unstake (auth)",
+        ],
+    })
+
+
+async def api_health(request):
+    return _json_resp({"ok": True, "status": "up", "ts": _now()})
+
+
+async def api_price(request):
+    price = market["price"]
+    p24 = await db_price_at(24)
+    lo24, hi24 = await db_price_range(24)
+    return _json_resp({
+        "ok": True,
+        "pair": "VRF/USD",
+        "price": price,
+        "prev_price": market["prev_price"],
+        "change_24h_pct": round(_change_pct(p24 or price, price), 4),
+        "high_24h": hi24 if hi24 is not None else price,
+        "low_24h": lo24 if lo24 is not None else price,
+        "fee_pct": TRADE_FEE_PCT,
+        "ts": _now(),
+    })
+
+
+async def api_price_history(request):
+    try:
+        hours = min(720, max(1, int(request.query.get("hours", 24))))
+    except ValueError:
+        return _err("hours must be an integer")
+    rows = await db_price_history(hours)
+    return _json_resp({
+        "ok": True,
+        "hours": hours,
+        "points": [{"ts": r[0], "price": r[1]} for r in rows],
+    })
+
+
+async def api_stats(request):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*), SUM(usd), SUM(vrf) FROM users") as cur:
+            n_users, sum_usd, sum_vrf = await cur.fetchone()
+        async with db.execute("SELECT COUNT(*), SUM(amount) FROM stakes WHERE status='active'") as cur:
+            n_stakes, sum_staked = await cur.fetchone()
+        async with db.execute("SELECT COUNT(*) FROM trades") as cur:
+            n_trades = (await cur.fetchone())[0]
+    return _json_resp({
+        "ok": True,
+        "users": n_users or 0,
+        "usd_in_circulation": sum_usd or 0,
+        "vrf_in_circulation": sum_vrf or 0,
+        "active_stakes": n_stakes or 0,
+        "vrf_staked": sum_staked or 0,
+        "total_trades": n_trades or 0,
+        "price": market["price"],
+    })
+
+
+async def api_tiers(request):
+    return _json_resp({
+        "ok": True,
+        "tiers": [
+            {"key": k, "label": t["label"], "apr": t["apr"],
+             "lock_days": t["lock_days"], "early_penalty": t["penalty"]}
+            for k, t in STAKE_TIERS.items()
+        ],
+    })
+
+
+# ── Authenticated endpoints (personal API key) ─────────
+
+async def api_me(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    price = market["price"]
+    stakes = await db_get_user_stakes(user["user_id"])
+    return _json_resp({
+        "ok": True,
+        "user_id": user["user_id"],
+        "usd": user["usd"],
+        "vrf": user["vrf"],
+        "scam": user["scam"],
+        "vrf_value_usd": round(user["vrf"] * price, 6),
+        "staked_vrf": sum(s["amount"] for s in stakes),
+        "pending_rewards_vrf": round(sum(stake_accrued(s) for s in stakes), 6),
+    })
+
+
+async def api_trade_buy(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    if _rate_limited(f"trade:{user['user_id']}"):
+        return _err("Rate limit exceeded", 429)
+    try:
+        body = await request.json()
+        amount = float(body["usd_amount"])
+    except Exception:
+        return _err('Body must be JSON: {"usd_amount": number}')
+    ok, msg = await _execute_buy(user["user_id"], amount)
+    if not ok:
+        return _err(msg.lstrip("❌ ").strip(), 400)
+    u2 = await db_get_user(user["user_id"])
+    return _json_resp({"ok": True, "usd": u2["usd"], "vrf": u2["vrf"], "price": market["price"]})
+
+
+async def api_trade_sell(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    if _rate_limited(f"trade:{user['user_id']}"):
+        return _err("Rate limit exceeded", 429)
+    try:
+        body = await request.json()
+        amount = float(body["vrf_amount"])
+    except Exception:
+        return _err('Body must be JSON: {"vrf_amount": number}')
+    ok, msg = await _execute_sell(user["user_id"], amount)
+    if not ok:
+        return _err(msg.lstrip("❌ ").strip(), 400)
+    u2 = await db_get_user(user["user_id"])
+    return _json_resp({"ok": True, "usd": u2["usd"], "vrf": u2["vrf"], "price": market["price"]})
+
+
+def _stake_json(s: dict) -> dict:
+    return {
+        "id": s["id"], "tier": s["tier"], "amount": s["amount"], "apr": s["apr"],
+        "lock_days": s["lock_days"], "start_ts": s["start_ts"],
+        "accrued_vrf": round(stake_accrued(s), 6),
+        "matured": stake_is_matured(s),
+        "seconds_left": stake_time_left(s),
+    }
+
+
+async def api_stakes_list(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    stakes = await db_get_user_stakes(user["user_id"])
+    return _json_resp({"ok": True, "stakes": [_stake_json(s) for s in stakes]})
+
+
+async def api_stakes_create(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    try:
+        body = await request.json()
+        tier = str(body["tier"])
+        amount = float(body["amount"])
+    except Exception:
+        return _err('Body must be JSON: {"tier": string, "amount": number}')
+    ok, msg = await _do_stake(user["user_id"], tier, amount)
+    if not ok:
+        return _err(msg.lstrip("❌ ").strip(), 400)
+    stakes = await db_get_user_stakes(user["user_id"])
+    return _json_resp({"ok": True, "stakes": [_stake_json(s) for s in stakes]}, 201)
+
+
+async def api_stake_claim(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    try:
+        sid = int(request.match_info["id"])
+    except ValueError:
+        return _err("Invalid stake id")
+    stake = await db_get_stake(sid)
+    if not stake or stake["status"] != "active" or stake["user_id"] != user["user_id"]:
+        return _err("Stake not found", 404)
+    acc = stake_accrued(stake)
+    if acc <= 0:
+        return _err("Nothing to claim yet", 400)
+    await db_touch_stake(sid, _now())
+    new_bal = await db_add_vrf(user["user_id"], acc)
+    return _json_resp({"ok": True, "claimed_vrf": round(acc, 6), "vrf_balance": new_bal})
+
+
+async def api_stake_unstake(request):
+    user = await _api_auth(request)
+    if not user:
+        return _err("Invalid or missing API key", 401)
+    try:
+        sid = int(request.match_info["id"])
+    except ValueError:
+        return _err("Invalid stake id")
+    stake = await db_get_stake(sid)
+    if not stake or stake["status"] != "active" or stake["user_id"] != user["user_id"]:
+        return _err("Stake not found", 404)
+
+    if stake["lock_days"] == 0 or stake_is_matured(stake):
+        acc = stake_accrued(stake)
+        payout = stake["amount"] + acc
+        await db_close_stake(sid, "withdrawn")
+        new_bal = await db_add_vrf(user["user_id"], payout)
+        return _json_resp({
+            "ok": True, "early": False, "principal": stake["amount"],
+            "interest": round(acc, 6), "payout_vrf": round(payout, 6),
+            "vrf_balance": new_bal,
+        })
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    if not body.get("confirm_early"):
+        penalty_amt = stake["amount"] * stake["penalty"]
+        return _err(
+            f"Lock not expired ({stake_time_left(stake)}s left). "
+            f"Early withdrawal forfeits interest and applies a "
+            f"{stake['penalty']*100:.0f}% penalty ({penalty_amt:.4f} VRF). "
+            f'Resend with {{"confirm_early": true}} to proceed.',
+            409,
+        )
+    penalty_amt = stake["amount"] * stake["penalty"]
+    get_back = stake["amount"] - penalty_amt
+    await db_close_stake(sid, "withdrawn_early")
+    new_bal = await db_add_vrf(user["user_id"], get_back)
+    return _json_resp({
+        "ok": True, "early": True, "penalty_vrf": round(penalty_amt, 6),
+        "payout_vrf": round(get_back, 6), "vrf_balance": new_bal,
+    })
+
+
+def _build_api_app():
+    from aiohttp import web as _web
+    app = _web.Application(middlewares=[_cors_middleware, _rl_middleware])
+    app.router.add_get("/", api_root)
+    app.router.add_get("/health", api_health)
+    app.router.add_get("/api/v1", api_root)
+    app.router.add_get("/api/v1/price", api_price)
+    app.router.add_get("/api/v1/price/history", api_price_history)
+    app.router.add_get("/api/v1/stats", api_stats)
+    app.router.add_get("/api/v1/tiers", api_tiers)
+    app.router.add_get("/api/v1/me", api_me)
+    app.router.add_post("/api/v1/trade/buy", api_trade_buy)
+    app.router.add_post("/api/v1/trade/sell", api_trade_sell)
+    app.router.add_get("/api/v1/stakes", api_stakes_list)
+    app.router.add_post("/api/v1/stakes", api_stakes_create)
+    app.router.add_post("/api/v1/stakes/{id}/claim", api_stake_claim)
+    app.router.add_post("/api/v1/stakes/{id}/unstake", api_stake_unstake)
+    return app
+
+
+def _run_api_server() -> None:
+    """Runs the aiohttp REST API in its own event loop / background thread,
+    since the bot's main thread is blocked inside app.run_polling()."""
+    async def _serve():
+        try:
+            from aiohttp import web as _web
+        except ImportError:
+            log.warning("aiohttp not installed — REST API disabled. pip install aiohttp")
+            return
+        web_app = _build_api_app()
+        runner = _web.AppRunner(web_app)
+        await runner.setup()
+        site = _web.TCPSite(runner, "0.0.0.0", API_PORT)
+        await site.start()
+        log.info("REST API listening on 0.0.0.0:%s  (see API_DOCS.md)", API_PORT)
+        await asyncio.Event().wait()
+
+    asyncio.run(_serve())
+
+
 async def on_startup(app: Application) -> None:
     await db_init()
     from telegram import BotCommand, BotCommandScopeDefault
@@ -1472,6 +2249,8 @@ async def on_startup(app: Application) -> None:
         BotCommand("stake",   "🔒 Стейкинг VRF"),
         BotCommand("stakes",  "📋 Мои активные стейки"),
         BotCommand("balance", "👤 Баланс и активы"),
+        BotCommand("apikey",  "🔑 Создать API-ключ для разработчиков"),
+        BotCommand("apikeys", "🗂 Мои API-ключи"),
         BotCommand("cancel",  "🚫 Отменить ввод суммы"),
         BotCommand("help",    "ℹ️ Помощь"),
     ]
@@ -1480,6 +2259,10 @@ async def on_startup(app: Application) -> None:
     except Exception:
         pass
     app.create_task(_price_ticker_loop())
+
+    t = threading.Thread(target=_run_api_server, daemon=True, name="vrf-api-server")
+    t.start()
+
     log.info("VRF Exchange Bot is online!")
 
 
@@ -1500,12 +2283,15 @@ def main() -> None:
     app.add_handler(CommandHandler("stake",   cmd_stake))
     app.add_handler(CommandHandler("stakes",  cmd_stakes))
     app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("apikey",  cmd_apikey))
+    app.add_handler(CommandHandler("apikeys", cmd_apikeys))
     app.add_handler(CommandHandler("cancel",  cmd_cancel))
 
     app.add_handler(CommandHandler("admin",    cmd_admin))
     app.add_handler(CommandHandler("setprice", cmd_setprice))
     app.add_handler(CommandHandler("addusd",   cmd_addusd))
     app.add_handler(CommandHandler("addvrf",   cmd_addvrf))
+    app.add_handler(CommandHandler("addscam",  cmd_addscam))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
