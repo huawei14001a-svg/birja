@@ -691,9 +691,23 @@ def _price_chart_sync(rows: list) -> Optional[bytes]:
 # макету и заданы в долях от размера картинки, поэтому подходят для
 # фона любого разрешения с тем же соотношением сторон.
 
-SCAM_BG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "assets", "scam_bg.png"
-)
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+SCAM_BG_PATH = os.path.join(_ASSETS_DIR, "scam_bg.png")
+
+# Шрифты зашиты в репозиторий (assets/fonts/) и подключаются В ПЕРВУЮ очередь —
+# так генерация картинок не зависит от того, какие шрифты стоят на сервере
+# Railway (по умолчанию их там может не быть вообще, отсюда OSError). Системные
+# пути ниже — просто запасной вариант для локального запуска.
+FONT_BOLD_PATHS = [
+    os.path.join(_ASSETS_DIR, "fonts", "DejaVuSans-Bold.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+FONT_REG_PATHS = [
+    os.path.join(_ASSETS_DIR, "fonts", "DejaVuSans.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
 
 # Зоны (x0, y0, x1, y1) в долях ширины/высоты фона
 SCAM_NUM_BBOX_FRAC   = (0.0859, 0.4111, 0.6805, 0.6958)   # крупная сумма
@@ -702,34 +716,42 @@ SCAM_USD_BBOX_FRAC   = (0.0961, 0.7625, 0.2844, 0.8653)   # "$ 0,00"
 
 SCAM_USD_DISPLAY = "0,00"   # у SCAM нет рыночной цены — токен-шутка, всегда $0
 
-_scam_bg_cache = None   # кэш загруженного фонового изображения (PIL.Image)
+_SENTINEL_MISSING = object()
+_scam_bg_cache = None   # None = ещё не пробовали · _SENTINEL_MISSING = пробовали, файла нет · Image = загружен
 
 
 def _load_scam_bg():
     global _scam_bg_cache
-    if _scam_bg_cache is not None:
-        return _scam_bg_cache
-    try:
-        from PIL import Image
-        _scam_bg_cache = Image.open(SCAM_BG_PATH).convert("RGB")
-    except Exception:
-        _scam_bg_cache = False   # запомнить, что файла нет, не пробовать каждый раз
-    return _scam_bg_cache or None
+    if _scam_bg_cache is None:
+        try:
+            from PIL import Image
+            _scam_bg_cache = Image.open(SCAM_BG_PATH).convert("RGB")
+        except Exception:
+            log.warning("SCAM background not found at %s — using fallback card", SCAM_BG_PATH)
+            _scam_bg_cache = _SENTINEL_MISSING
+    return None if _scam_bg_cache is _SENTINEL_MISSING else _scam_bg_cache
 
 
 def _fit_text(draw, text: str, paths: list, max_w: int, max_h: int,
               max_size: int = 440, min_size: int = 10, step: int = 2):
-    """Подбирает наибольший размер шрифта, при котором text помещается в max_w×max_h."""
+    """Подбирает наибольший размер шрифта, при котором text помещается в max_w×max_h.
+    Никогда не бросает исключение — при отсутствии всех шрифтов из paths
+    откатывается на встроенный шрифт Pillow (ImageFont.load_default)."""
     from PIL import ImageFont
+
+    def _load(path, size):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            return None
+
     size = max_size
     while size >= min_size:
         font = None
         for p in paths:
-            try:
-                font = ImageFont.truetype(p, size)
+            font = _load(p, size)
+            if font:
                 break
-            except Exception:
-                continue
         if font is None:
             size -= step
             continue
@@ -738,9 +760,19 @@ def _fit_text(draw, text: str, paths: list, max_w: int, max_h: int,
         if w <= max_w and h <= max_h:
             return font, bbox
         size -= step
-    font = ImageFont.truetype(paths[0], min_size)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return font, bbox
+
+    # Последняя попытка на минимальном размере любым доступным шрифтом
+    for p in paths:
+        font = _load(p, min_size)
+        if font:
+            return font, draw.textbbox((0, 0), text, font=font)
+
+    # Абсолютный fallback — встроенный битмап-шрифт Pillow, есть всегда
+    try:
+        font = ImageFont.load_default(size=min_size)
+    except TypeError:
+        font = ImageFont.load_default()
+    return font, draw.textbbox((0, 0), text, font=font)
 
 
 def _scam_card_image_sync(amount: float) -> Optional[bytes]:
@@ -758,10 +790,6 @@ def _scam_card_image_sync(amount: float) -> Optional[bytes]:
     W, H = img.size
     d = ImageDraw.Draw(img)
 
-    _BOLD = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
     WHITE = (255, 255, 255)
     GRAY  = (150, 163, 180)
 
@@ -771,7 +799,7 @@ def _scam_card_image_sync(amount: float) -> Optional[bytes]:
 
     def draw_fitted(frac, text, color):
         x0, y0, x1, y1 = box_px(frac)
-        font, bbox = _fit_text(d, text, _BOLD, x1 - x0, y1 - y0)
+        font, bbox = _fit_text(d, text, FONT_BOLD_PATHS, x1 - x0, y1 - y0)
         th = bbox[3] - bbox[1]
         tx = x0 - bbox[0]
         ty = y0 + ((y1 - y0) - th) // 2 - bbox[1]
@@ -793,7 +821,7 @@ def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
     (например, файл ещё не закоммичен) — рисует минималистичную тёмную карточку,
     чтобы бот не падал и перевод всё равно прошёл с картинкой."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except ImportError:
         return None
 
@@ -806,16 +834,12 @@ def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
         col = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(3))
         d.line([(0, y), (W, y)], fill=col)
 
-    _BOLD = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
     amount_str = fmt_scam(amount)
-    font, bbox = _fit_text(d, amount_str, _BOLD, int(W * 0.6), int(H * 0.28))
+    font, bbox = _fit_text(d, amount_str, FONT_BOLD_PATHS, int(W * 0.6), int(H * 0.28))
     tx = int(W * 0.086) - bbox[0]
     ty = int(H * 0.41) - bbox[1]
     d.text((tx, ty), amount_str, font=font, fill=(255, 255, 255))
-    font2, bbox2 = _fit_text(d, "SCAM", _BOLD, 200, 60)
+    font2, bbox2 = _fit_text(d, "SCAM", FONT_BOLD_PATHS, 200, 60)
     d.text((int(W * 0.70) - bbox2[0], int(H * 0.64) - bbox2[1]), "SCAM", font=font2, fill=(150, 163, 180))
 
     buf = io.BytesIO()
