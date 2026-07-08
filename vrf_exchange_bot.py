@@ -683,25 +683,122 @@ def _price_chart_sync(rows: list) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════
-#      SCAM TRANSFER RECEIPT IMAGE  🎭  (Pillow)
+#      SCAM TRANSFER CARD IMAGE  🎭  (Pillow + фото-шаблон)
 # ══════════════════════════════════════════════════════
-# Генерируется при переводе токена SCAM через текстовую команду "пер".
+# Рисует сумму поверх фиксированного фона assets/scam_bg.png (свой
+# арт-дирекшн + иконки уже вшиты в сам файл — код только позиционирует
+# текст в размеченные под него зоны). Позиции измерены по референсному
+# макету и заданы в долях от размера картинки, поэтому подходят для
+# фона любого разрешения с тем же соотношением сторон.
 
-def _scam_transfer_image_sync(amount: float, sender_name: str, recipient_name: str) -> Optional[bytes]:
+SCAM_BG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "scam_bg.png"
+)
+
+# Зоны (x0, y0, x1, y1) в долях ширины/высоты фона
+SCAM_NUM_BBOX_FRAC   = (0.0859, 0.4111, 0.6805, 0.6958)   # крупная сумма
+SCAM_LABEL_BBOX_FRAC = (0.6984, 0.6389, 0.8188, 0.6917)   # тег "SCAM"
+SCAM_USD_BBOX_FRAC   = (0.0961, 0.7625, 0.2844, 0.8653)   # "$ 0,00"
+
+SCAM_USD_DISPLAY = "0,00"   # у SCAM нет рыночной цены — токен-шутка, всегда $0
+
+_scam_bg_cache = None   # кэш загруженного фонового изображения (PIL.Image)
+
+
+def _load_scam_bg():
+    global _scam_bg_cache
+    if _scam_bg_cache is not None:
+        return _scam_bg_cache
+    try:
+        from PIL import Image
+        _scam_bg_cache = Image.open(SCAM_BG_PATH).convert("RGB")
+    except Exception:
+        _scam_bg_cache = False   # запомнить, что файла нет, не пробовать каждый раз
+    return _scam_bg_cache or None
+
+
+def _fit_text(draw, text: str, paths: list, max_w: int, max_h: int,
+              max_size: int = 440, min_size: int = 10, step: int = 2):
+    """Подбирает наибольший размер шрифта, при котором text помещается в max_w×max_h."""
+    from PIL import ImageFont
+    size = max_size
+    while size >= min_size:
+        font = None
+        for p in paths:
+            try:
+                font = ImageFont.truetype(p, size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            size -= step
+            continue
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if w <= max_w and h <= max_h:
+            return font, bbox
+        size -= step
+    font = ImageFont.truetype(paths[0], min_size)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return font, bbox
+
+
+def _scam_card_image_sync(amount: float) -> Optional[bytes]:
+    """Карточка перевода SCAM: фон-шаблон + сумма + тег SCAM + $-эквивалент."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    bg = _load_scam_bg()
+    if bg is None:
+        return _scam_card_fallback_sync(amount)
+
+    img = bg.copy()
+    W, H = img.size
+    d = ImageDraw.Draw(img)
+
+    _BOLD = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    WHITE = (255, 255, 255)
+    GRAY  = (150, 163, 180)
+
+    def box_px(frac):
+        x0, y0, x1, y1 = frac
+        return int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)
+
+    def draw_fitted(frac, text, color):
+        x0, y0, x1, y1 = box_px(frac)
+        font, bbox = _fit_text(d, text, _BOLD, x1 - x0, y1 - y0)
+        th = bbox[3] - bbox[1]
+        tx = x0 - bbox[0]
+        ty = y0 + ((y1 - y0) - th) // 2 - bbox[1]
+        d.text((tx, ty), text, font=font, fill=color)
+
+    amount_str = fmt_scam(amount)
+    draw_fitted(SCAM_NUM_BBOX_FRAC, amount_str, WHITE)
+    draw_fitted(SCAM_LABEL_BBOX_FRAC, "SCAM", GRAY)
+    draw_fitted(SCAM_USD_BBOX_FRAC, f"$ {SCAM_USD_DISPLAY}", GRAY)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def _scam_card_fallback_sync(amount: float) -> Optional[bytes]:
+    """Запасной вариант, если assets/scam_bg.png не найден рядом со скриптом
+    (например, файл ещё не закоммичен) — рисует минималистичную тёмную карточку,
+    чтобы бот не падал и перевод всё равно прошёл с картинкой."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return None
 
-    W, H = 800, 420
-    BG_TOP = (22, 6, 10)
-    BG_BOT = (54, 12, 16)
-    GOLD   = (255, 197, 64)
-    RED    = (224, 64, 64)
-    WHITE  = (238, 230, 226)
-    MUTED  = (170, 140, 140)
-    LINE   = (96, 44, 44)
-
+    W, H = 1280, 720
+    BG_TOP, BG_BOT = (8, 12, 20), (10, 16, 28)
     img = Image.new("RGB", (W, H), BG_TOP)
     d = ImageDraw.Draw(img)
     for y in range(H):
@@ -709,77 +806,17 @@ def _scam_transfer_image_sync(amount: float, sender_name: str, recipient_name: s
         col = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(3))
         d.line([(0, y), (W, y)], fill=col)
 
-    # Diagonal hazard-stripe accents (top-left / bottom-right corners)
-    stripe_w = 14
-    for x in range(-H, W, stripe_w * 2):
-        d.line([(x, 0), (x + H, H)], fill=(0, 0, 0), width=stripe_w)
-    overlay = Image.new("RGB", (W, H), BG_TOP)
-    od = ImageDraw.Draw(overlay)
-    for y in range(H):
-        t = y / H
-        col = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(3))
-        od.line([(0, y), (W, y)], fill=col)
-    img = Image.blend(img, overlay, 0.86)
-    d = ImageDraw.Draw(img)
-
     _BOLD = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]
-    _REG = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-
-    def _font(paths, size):
-        for p in paths:
-            try:
-                return ImageFont.truetype(p, size)
-            except (OSError, IOError):
-                continue
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:
-            return ImageFont.load_default()
-
-    f_amount = _font(_BOLD, 92)
-    f_tag    = _font(_BOLD, 32)
-    f_body   = _font(_REG, 25)
-    f_small  = _font(_REG, 18)
-
-    def tw(s, f):
-        b = d.textbbox((0, 0), s, font=f)
-        return b[2] - b[0]
-
-    def tc(cy, s, f, fill):
-        x = W // 2 - tw(s, f) // 2
-        d.text((x, cy), s, font=f, fill=fill)
-
     amount_str = fmt_scam(amount)
-
-    # Top: big amount, gold with drop shadow
-    x = W // 2 - tw(amount_str, f_amount) // 2
-    d.text((x + 3, 66 + 3), amount_str, font=f_amount, fill=(0, 0, 0))
-    d.text((x, 66), amount_str, font=f_amount, fill=GOLD)
-
-    # SCAM tag chip under the amount
-    tag = "SCAM"
-    tag_w = tw(tag, f_tag)
-    cx1, cy1 = W // 2 - tag_w // 2 - 18, 178
-    cx2, cy2 = W // 2 + tag_w // 2 + 18, 178 + 46
-    d.rounded_rectangle([cx1, cy1, cx2, cy2], radius=10, outline=RED, width=2)
-    tc(cy1 + 8, tag, f_tag, RED)
-
-    # Divider
-    d.line([(70, 258), (W - 70, 258)], fill=LINE, width=2)
-
-    # Bottom sentence — exact requested template
-    bottom = f"#SCAM отправил(а) {amount_str} SCAM для {recipient_name}"
-    tc(288, bottom, f_body, WHITE)
-
-    # Small sender attribution line
-    small = f"от {sender_name}"
-    tc(330, small, f_small, MUTED)
+    font, bbox = _fit_text(d, amount_str, _BOLD, int(W * 0.6), int(H * 0.28))
+    tx = int(W * 0.086) - bbox[0]
+    ty = int(H * 0.41) - bbox[1]
+    d.text((tx, ty), amount_str, font=font, fill=(255, 255, 255))
+    font2, bbox2 = _fit_text(d, "SCAM", _BOLD, 200, 60)
+    d.text((int(W * 0.70) - bbox2[0], int(H * 0.64) - bbox2[1]), "SCAM", font=font2, fill=(150, 163, 180))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
@@ -1801,10 +1838,16 @@ async def _execute_scam_transfer(context, chat_id: int, reply_msg_id: int,
     await db_log_scam_transfer(sender.id, recipient.id, amount)
 
     loop = asyncio.get_running_loop()
-    img = await loop.run_in_executor(
-        None, _scam_transfer_image_sync, amount, sender.first_name, recipient.first_name,
+    img = await loop.run_in_executor(None, _scam_card_image_sync, amount)
+
+    # Жирный текст в блок-цитате (нативный Telegram <blockquote>), получатель —
+    # кликабельная ссылка на его профиль (tg://user?id=...).
+    caption = (
+        "<blockquote><b>🎭 #SCAM\n"
+        f"{mention(sender.id, sender.first_name)} отправил(а) "
+        f"{fmt_scam(amount)} SCAM для {mention(recipient.id, recipient.first_name)}"
+        "</b></blockquote>"
     )
-    caption = f"#SCAM отправил(а) {fmt_scam(amount)} SCAM для {recipient.first_name}"
 
     if img:
         await context.bot.send_photo(
